@@ -10,7 +10,7 @@ COPY . .
 
 FROM node:20-alpine as production
 
-RUN addgroup -s appgroup && adduser -S appuser -G appgroup
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 
 WORKDIR /app
 
