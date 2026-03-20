@@ -1,0 +1,307 @@
+##Namespace
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: jerney
+---
+## Secrets
+apiVersion: v1
+kind: Secret
+metadata:
+  name: jerney-db-secrets
+  namespace: jerney
+data:
+  POSTGRES_USER: amVybmV5X3VzZXI=
+  POSTGRES_PASSWORD: amVybmV5X3Bhc3NfMjAyNg==
+  POSTGRES_DB: amVybmV5X2Ri
+type: Opaque
+---
+## Storage Class
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: jerney-storage-class
+  namespace: jerney
+provisioner:  ebs.csi.eks.amazonaws.com
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  type: gp3
+  encrypted: "true"
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+---
+## Persistent Volume Claim
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jerney-pvc
+  namespace: jerney
+spec:
+  storageClassName: jerney-storage-class # or a specific storage class name, e.g., 'rook-cephfs'
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+## DB Deployment yaml (Postgress)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jerney-db-deployment
+  namespace: jerney
+  labels:
+    app: jerney-db
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jerney-db
+  template:
+    metadata:
+      labels:
+        app: jerney-db
+    spec:
+      automountServiceAccountToken: false
+      containers:
+      - name: jerney-db
+        image: postgres:16
+        ports:
+        - containerPort: 5432
+        envFrom:
+          - secretRef:
+              name: jerney-db-secrets
+        volumeMounts:
+        - mountPath: /var/lib/postgresql/data
+          name: jerney-db
+        resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+        livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "jerney_user", "-d", "jerney_db"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+        readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "jerney_user", "-d", "jerney_db"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+      volumes:
+      - name: jerney-db
+        persistentVolumeClaim:
+          claimName: jerney-pvc # Maps to a Persistent Volume Claim
+
+---
+## DB Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: jerney-db-service # Name of the service, used as the internal DNS name
+  namespace: jerney
+spec:
+  selector:
+    app: jerney-db # This must match the labels on your database Pod(s)
+  ports:
+    - protocol: TCP
+      port: 5432 # The port the service itself exposes
+      targetPort: 5432 # The port the container in the Pod is listening on
+  type: ClusterIP # Default type, makes the service only reachable from within the cluster
+
+
+---
+## Network Policies
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-backend-to-db
+  namespace: jerney
+spec:
+  podSelector:
+    matchLabels:
+      app: jerney-db # Target pods that receive traffic
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: jerney-backend # Allowed source pods
+    ports:
+    - protocol: TCP
+      port: 5432 # Allowed port
+  
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jerney-backend-deployment
+  namespace: jerney
+  labels:
+    app: jerney-backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: jerney-backend
+  template:
+    metadata:
+      labels:
+        app: jerney-backend
+    spec:
+      containers:
+      - name: jerney-backend
+        image: ghcr.io/vineetkhisty/jerney-backend:latest
+        ports:
+        - containerPort: 80
+        env:
+          - name: PORT
+            value: "5000"
+          - name: DB_HOST
+            value: "jerney_db"
+          - name: DB_PORT
+            value: "5432"
+          - name: DB_USER
+            valueFrom:
+              secretKeyRef:
+                  name: jerney-db-secrets
+                  key: POSTGRES_USER
+          - name: DB_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                  name: jerney-db-secrets
+                  key: POSTGRES_PASSWORD
+          - name: DB_NAME
+            valueFrom:
+              secretKeyRef:
+                  name: jerney-db-secrets
+                  key: POSTGRES_DB
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 300m
+            memory: 256Mi
+        livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 5000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+        readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 5000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+---
+## Service for the backend
+apiVersion: v1
+kind: Service
+metadata:
+  name: jerney-backend-service
+  namespace: jerney
+spec:
+  type: ClusterIP
+  selector:
+      app: jerney-backend
+  ports:
+    - port: 5000
+      targetPort: 5000
+      protocol: TCP
+---
+## Network Policy for backend
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend-to-backend
+  namespace: jerney
+spec:
+  podSelector:
+    matchLabels:
+      app: jerney-backend # Target pods that receive traffic
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: jerney-frontend # Allowed source pods
+    ports:
+    - protocol: TCP
+      port: 5000 # Allowed port
+---
+## Deployment of frontend
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jerney-frontend-deployment
+  namespace: jerney
+  labels:
+    app: jerney-frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: jerney-frontend
+  template:
+    metadata:
+      labels:
+        app: jerney-frontend
+    spec:
+      containers:
+      - name: jerney-frontend
+        image: ghcr.io/vineetkhisty/jerney-frontend:latest
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+        livenessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+        readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+---
+## Service for the backend
+apiVersion: v1
+kind: Service
+metadata:
+  name: jerney-frontend-service
+  namespace: jerney
+spec:
+  type: ClusterIP
+  selector:
+      app: jerney-frontend
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
